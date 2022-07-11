@@ -9,6 +9,10 @@ MODULE DFTBPLUS_ENGINE
        MDI_Register_callback, MDI_COMMAND_LENGTH, MDI_MPI_get_world_comm, &
        MDI_Plugin_get_argc, MDI_Plugin_get_arg
 
+  USE dftbp_common_environment, ONLY : TEnvironment, TEnvironment_init
+  USE dftbp_dftbplus_inputdata, ONLY : TInputData
+  USE dftbp_dftbplus_initprogram, ONLY : TDftbPlusMain
+
   IMPLICIT NONE
 
   INTEGER, PARAMETER :: dp = selected_real_kind(15, 307)
@@ -22,9 +26,17 @@ MODULE DFTBPLUS_ENGINE
   ! Flag to terminate MDI response function
   LOGICAL :: terminate_flag = .false.
 
+  ! Create DFTB+ instance and environment
+  type(TEnvironment) :: env
+  type(TDftbPlusMain) :: main
+
+  ! Create DFTB+ input
+  type(TInputData), allocatable :: input
+
 CONTAINS
 
   FUNCTION MDI_Plugin_init_dftbplus() bind ( C, name="MDI_Plugin_init_dftbplus" )
+
     INTEGER :: MDI_Plugin_init_dftbplus
     INTEGER :: ierr
     INTEGER :: argc
@@ -32,6 +44,8 @@ CONTAINS
     CHARACTER(LEN=1024) :: option
     CHARACTER(LEN=1024) :: mdi_options
     LOGICAL :: mdi_options_found
+
+    real*8 :: initialEnergy
 
     ! Get the command-line options from the driver
     mdi_options_found = .false.
@@ -73,6 +87,8 @@ CONTAINS
 
 
   SUBROUTINE initialize_mdi()
+    USE dftbp_dftbplus_hsdhelpers, only : parseHsdInput 
+
     INTEGER :: ierr, role
 
     PROCEDURE(execute_command), POINTER :: generic_command => null()
@@ -88,12 +104,35 @@ CONTAINS
     ! Register the commands
     CALL MDI_Register_node("@DEFAULT", ierr)
     CALL MDI_Register_command("@DEFAULT", "EXIT", ierr)
+    CALL MDI_Register_command("@DEFAULT", "<CELL", ierr)
+    CALL MDI_Register_command("@DEFAULT", ">CELL", ierr)
+    CALL MDI_Register_command("@DEFAULT", "<CELL_DISPL", ierr)
+    CALL MDI_Register_command("@DEFAULT", "<CHARGES", ierr)
+    CALL MDI_Register_command("@DEFAULT", "<COORDS", ierr)
+    CALL MDI_Register_command("@DEFAULT", ">COORDS", ierr)
+    CALL MDI_Register_command("@DEFAULT", "<DIMENSIONS", ierr)
+    CALL MDI_Register_command("@DEFAULT", "<ELEMENTS", ierr)
+    CALL MDI_Register_command("@DEFAULT", "<ENERGY", ierr)
+    CALL MDI_Register_command("@DEFAULT", "<FORCES", ierr)
+    CALL MDI_Register_command("@DEFAULT", "<NATOMS", ierr)
+    CALL MDI_Register_command("@DEFAULT", "<PE", ierr)
 
     ! Connct to the driver
     CALL MDI_Accept_communicator(comm, ierr)
 
     ! Set the generic execute_command function
     CALL MDI_Set_execute_command_func(generic_command, class_obj, ierr)
+
+    ! Initialize DFTB+
+    ! Initialize DFTB+ Environment
+    CALL TEnvironment_init(env)
+
+    ! Parse DFTB+ input
+    allocate(input)
+    CALL parseHsdInput(input)
+
+    ! Initialize variables according to input
+    call main%initProgramVariables(input, env)
 
   END SUBROUTINE initialize_mdi
 
@@ -132,12 +171,343 @@ CONTAINS
     SELECT CASE( TRIM(command) )
     CASE( "EXIT" )
        terminate_flag = .true.
+       deallocate(input)
+   case( "<CELL" )
+      call send_cell(comm)
+   case( ">CELL" )
+      call recv_cell(comm)
+   case( "<CELL_DISPL" )
+      call send_cell_displ(comm)
+   case( "<CHARGES" )
+      call send_charges(comm)
+   case( "<COORDS" )
+      call send_coords(comm)
+   case( ">COORDS" )
+      call recv_coords(comm)
+   case( "<DIMENSIONS" )
+      call send_dimensions(comm)
+   case( "<ELEMENTS" )
+      call send_elements(comm)
+   case( "<ENERGY" )
+      call send_energy(comm)
+   case( "<FORCES" )
+      call send_forces(comm)
+   case( "<NATOMS" )
+      call send_natoms(comm)
+   case( "<PE" )
+      call send_energy(comm)
     CASE DEFAULT
-       WRITE(6,*)'Error: command not recognized'
+       WRITE(6,*)'Error: command not recognized: ',command
        STOP 1
     END SELECT
 
     ierr = 0
   END SUBROUTINE execute_command
+
+
+   !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+   !
+   ! Corresponds to <ENERGY
+   !
+   !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+  SUBROUTINE send_energy(comm)
+   USE mdi , ONLY    : MDI_DOUBLE, MDI_Send
+   USE dftbp_dftbplus_mainapi, ONLY : getEnergy
+
+   implicit none
+   integer, intent(in)          :: comm
+   integer                      :: ierr
+   real*8                       :: etotal
+
+   ! DFTB+ uses Hartrees, so no need to convert.
+   call getEnergy(env, main, etotal)
+   call MDI_Send(etotal, 1, MDI_DOUBLE, comm, ierr)
+
+  END SUBROUTINE send_energy
+
+
+   !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+   !
+   ! Corresponds to <CELL
+   !
+   !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+  SUBROUTINE send_cell(comm)
+   USE mdi, ONLY     : MDI_DOUBLE, MDI_Send
+
+   implicit none
+   integer, intent(in)     :: comm
+   integer                 :: ierr
+   real*8, dimension(9)    :: latVecs
+
+   ! Check if simulation is periodic
+   if (.not. main%tPeriodic) THEN
+      write (*,*) "Simulation cell has been requested, but simulation is not periodic."
+      call EXIT(1)
+   END IF
+
+   ! DFTB+ uses atomic length units, so no need to convert.
+   latVecs = RESHAPE(main%latVec, (/9/))
+   call MDI_Send(latVecs, 9, MDI_Double, comm, ierr)
+
+  END SUBROUTINE send_cell
+
+
+   !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+   !
+   ! Corresponds to >CELL
+   !
+   !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+  SUBROUTINE recv_cell(comm)
+   USE mdi, ONLY     : MDI_DOUBLE, MDI_Send
+
+   implicit none
+   integer, intent(in)     :: comm
+   integer                 :: ierr
+   real*8, dimension(9)    :: latVecs
+
+   ! Check if simulation is periodic
+   if (.not. main%tPeriodic) THEN
+      write (*,*) "Simulation cell has been requested, but simulation is not periodic."
+      call EXIT(1)
+   END IF
+
+   ! DFTB+ uses atomic length units, so no need to convert.
+   call MDI_Recv(latVecs, 9, MDI_Double, comm, ierr)
+   main%latVec = RESHAPE(latVecs, (/3,3/))
+
+  END SUBROUTINE recv_cell
+
+
+   !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+   !
+   ! Corresponds to <CELL_DISPL
+   !
+   !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+  SUBROUTINE send_cell_displ(comm)
+   USE mdi, only     : MDI_DOUBLE, MDI_Send
+
+   implicit none
+   integer, intent(in)  :: comm
+   integer              :: ierr
+   real*8, dimension(3) :: origin
+
+   ! Check if simulation is periodic
+   if (.not. main%tPeriodic) THEN
+      write (*,*) "Simulation cell has been requested, but simulation is not periodic."
+      call EXIT(1)
+   END IF
+
+   ! retrieve the origin of the cell
+   call MDI_Send(origin, 3, MDI_Double, comm, ierr)
+
+  END SUBROUTINE send_cell_displ
+
+
+   !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+   !
+   ! Corresponds to <CHARGES
+   !
+   !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+  SUBROUTINE send_charges(comm)
+   USE mdi, ONLY       : MDI_DOUBLE, MDI_Send
+   USE dftbp_dftbplus_mainapi, ONLY : getGrossCharges, nrOfAtoms
+
+   implicit none
+   integer, intent(in)        :: comm
+   integer                    :: ierr
+   integer                    :: nAtoms
+   real*8, allocatable        :: atomCharges(:)
+
+   nAtoms = nrOfAtoms(main)
+
+   allocate( atomCharges(nAtoms) )
+
+   call getGrossCharges(env, main, atomCharges)
+   call MDI_Send(atomCharges, nAtoms, MDI_DOUBLE, comm, ierr)
+
+   deallocate( atomCharges )
+
+   END SUBROUTINE send_charges
+
+
+   !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+   !
+   ! Corresponds to <COORDS
+   !
+   !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+   SUBROUTINE send_coords(comm)
+      USE mdi, ONLY          : MDI_DOUBLE, MDI_Send
+      USE dftbp_dftbplus_mainapi, ONLY : nrOfAtoms
+
+      implicit none
+      integer, intent(in)        :: comm
+      integer                    :: ierr
+      integer                    :: nAtoms
+      integer                    :: nCoords
+      real*8, allocatable        :: atomCoords(:)
+
+      nAtoms = nrOfAtoms(main)
+      nCoords = 3 * nAtoms
+
+      allocate( atomCoords(nCoords) )
+
+      atomCoords = RESHAPE( main%coord0, (/nCoords/) )
+
+      call MDI_Send(atomCoords, nCoords, MDI_DOUBLE, comm, ierr)
+
+      deallocate( atomCoords )
+
+   END SUBROUTINE send_coords
+
+
+   !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+   !
+   ! Corresponds to >COORDS
+   !
+   !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+   SUBROUTINE recv_coords(comm)
+      USE mdi, ONLY          : MDI_DOUBLE, MDI_Send
+      USE dftbp_dftbplus_mainapi, ONLY : nrOfAtoms
+
+      implicit none
+      integer, intent(in)        :: comm
+      integer                    :: ierr
+      integer                    :: nAtoms
+      integer                    :: nCoords
+      real*8, allocatable        :: atomCoords(:)
+
+      nAtoms = nrOfAtoms(main)
+      nCoords = 3 * nAtoms
+
+      allocate( atomCoords(nCoords) )
+
+      call MDI_Recv(atomCoords, nCoords, MDI_DOUBLE, comm, ierr)
+      main%coord0 = RESHAPE( atomCoords, (/3,nAtoms/) )
+
+      deallocate( atomCoords )
+
+   END SUBROUTINE recv_coords
+
+
+   !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+   !
+   ! Corresponds to <DIMENSIONS
+   !
+   !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+   SUBROUTINE send_dimensions(comm)
+      USE mdi, ONLY           : MDI_INT, MDI_Send
+
+      implicit none
+      integer, intent(in)        :: comm
+      integer                    :: ierr
+      integer, dimension(3)       :: periodicity
+
+      ! valid calculation types seem to be either cluster (non periodic)
+      ! or supercell (periodic in three dimensions)
+      ! MDI allows us to send per dimension, but seems to be same for all
+      ! dimensions in DFTB+
+
+      if (main%tPeriodic) then
+         periodicity = (/ 2, 2, 2 /)
+      else
+         periodicity = (/ 1, 1, 1 /)
+      end if
+
+      call MDI_Send(periodicity, 3, MDI_INT, comm, ierr)
+
+   END SUBROUTINE send_dimensions
+
+
+   !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+   !
+   ! Corresponds to <ELEMENTS
+   !
+   !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+   SUBROUTINE send_elements(comm)
+      USE mdi, ONLY     : MDI_INT, MDI_Send
+      USE dftbp_dftbplus_mainapi, ONLY : nrOfAtoms
+
+      implicit none
+      integer, intent(in)        :: comm
+      integer                    :: ierr
+      integer                    :: nAtoms
+
+      nAtoms = nrOfAtoms(main)
+
+      !! this is sending atom types, not elements
+      !! Need to fix this.
+      call MDI_Send(main%species0, nAtoms, MDI_INT, comm, ierr)
+
+   END SUBROUTINE send_elements 
+
+
+   !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+   !
+   ! Corresponds to <FORCES
+   !
+   !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+   SUBROUTINE send_forces(comm)
+      USE mdi, ONLY        : MDI_DOUBLE, MDI_Send
+      USE dftbp_dftbplus_mainapi, ONLY: getGradients, nrOfAtoms
+
+      implicit none
+      integer, intent(in)        :: comm
+      integer                    :: ierr
+      integer                    :: nAtoms
+      integer                    :: nGradients
+      real*8, allocatable        :: atomGradients(:,:)
+      real*8, allocatable        :: flattenGradients(:)
+
+      nAtoms = nrOfAtoms(main)
+      nGradients = 3 * nAtoms
+
+      allocate( atomGradients(nAtoms, 3) )
+      allocate( flattenGradients(nGradients) )
+
+      call getGradients(env, main, atomGradients)
+
+      ! Force is negative of gradient. Check this, though.
+      flattenGradients = -1. * RESHAPE( atomGradients, (/nGradients/) )
+
+      call MDI_Send(flattenGradients, nGradients, MDI_DOUBLE, comm, ierr)
+
+      deallocate( atomGradients )
+      deallocate( flattenGradients )
+
+   END SUBROUTINE send_forces
+
+
+   !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+   !
+   ! Corresponds to <NATOMS
+   !
+   !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+   SUBROUTINE send_natoms(comm)
+      USE mdi, ONLY          : MDI_INT, MDI_Send
+      USE dftbp_dftbplus_mainapi, ONLY : nrOfAtoms
+
+      implicit none
+      integer, intent(in)        :: comm
+      integer                    :: ierr
+      integer                    :: nAtoms
+
+      nAtoms = nrOfAtoms(main)
+
+      call MDI_Send(nAtoms, 1, MDI_INT, comm, ierr)
+
+   END SUBROUTINE send_natoms
+
+
 
 END MODULE DFTBPLUS_ENGINE
